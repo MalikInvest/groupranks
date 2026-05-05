@@ -650,14 +650,15 @@ def heat_color(value: float, vmin: float, vmax: float) -> str:
 def halal_bar_html(n_h: int, n_q: int, n_total: int) -> str:
     if n_total <= 0:
         return ""
-    pct_h = n_h / n_total
-    pct_q = n_q / n_total
+    # Clamp to [0, 1] as a safety net — should never exceed but defensive coding.
+    pct_h = min(1.0, max(0.0, n_h / n_total))
+    pct_q = min(1.0 - pct_h, max(0.0, n_q / n_total))
     return (
         f'<span class="halal-bar" title="{n_h} halal · {n_q} questionable · {n_total - n_h - n_q} haram">'
         f'<span class="h" style="width:{pct_h*64:.1f}px;"></span>'
         f'<span class="q" style="width:{pct_q*64:.1f}px;"></span>'
         f'</span>'
-        f'<span class="halal-pct">{int(pct_h*100)}%</span>'
+        f'<span class="halal-pct">{int(round(pct_h*100))}%</span>'
     )
 
 
@@ -707,8 +708,9 @@ def build_html(
     vmax = sector_stats["avg_rank"].max() if len(sector_stats) else 1
 
     def list_li(row):
-        ph = halal_bar_html(int(row["n_halal"]), int(row["n_questionable"]), int(row["n_with_data"])) \
-             if row["n_with_data"] > 0 else ""
+        n_total = int(row["n_halal"]) + int(row["n_questionable"]) + int(row["n_haram"])
+        ph = halal_bar_html(int(row["n_halal"]), int(row["n_questionable"]), n_total) \
+             if n_total > 0 else ""
         return (
             f'<li data-group="{row["group"]}">'
             f'<span class="rk">#{int(row["rank"])}</span>'
@@ -731,13 +733,17 @@ def build_html(
         )
     heat_html = "\n".join(heat_cells)
 
-    sectors = sorted(df["sector"].dropna().unique())
+    sectors = sorted(df_with_data["sector"].dropna().unique())
     sector_options = '<option value="">All sectors</option>' + "".join(
         f'<option value="{s}">{s}</option>' for s in sectors
     )
 
     body_rows = []
-    for _, r in df.iterrows():
+    # Only render groups that have at least one stock with data — empty
+    # groups (taxonomy entries with no constituents mapped, or groups whose
+    # tickers all failed to fetch) are hidden from the table to keep the
+    # page clean. They remain in the taxonomy and can be populated later.
+    for _, r in df_with_data.iterrows():
         rk = r["rank"]
         cls = rank_pill_class(rk, n)
         rk_html = (f'<span class="rank-pill {cls}">{int(rk)}</span>'
@@ -745,9 +751,15 @@ def build_html(
         search_blob = f"{r['group']} {r['sector']}".lower()
         n_h = int(r.get("n_halal", 0))
         n_q = int(r.get("n_questionable", 0))
+        n_haram = int(r.get("n_haram", 0))
+        # The halal counts come from the constituent map (every mapped ticker),
+        # but n_with_data only counts tickers where Yahoo returned prices.
+        # Use the sum of halal/question/haram as the denominator so the
+        # percentages always make sense even when some tickers lack prices.
+        nd_for_halal = n_h + n_q + n_haram
         nd = int(r["n_with_data"])
-        halal_html = halal_bar_html(n_h, n_q, nd) if nd > 0 else ""
-        halal_pct = (n_h / nd) if nd > 0 else 0.0
+        halal_html = halal_bar_html(n_h, n_q, nd_for_halal) if nd_for_halal > 0 else ""
+        halal_pct = (n_h / nd_for_halal) if nd_for_halal > 0 else 0.0
         body_rows.append(
             f'<tr class="group-row" data-group="{r["group"]}" '
             f'data-sector="{r["sector"]}" data-search="{search_blob}" '
@@ -767,11 +779,16 @@ def build_html(
     summary_total = len(df)
     summary_universe = int(df["n_with_data"].sum())
 
-    # Universe-wide Shariah counts
+    # Universe-wide Shariah counts. The denominator must be the sum of all
+    # Shariah classifications, not n_with_data, because not every classified
+    # ticker has price data in any given run.
     n_halal_total = int(df["n_halal"].sum())
     n_question_total = int(df["n_questionable"].sum())
     n_haram_total = int(df["n_haram"].sum())
-    pct_halal_universe = n_halal_total / summary_universe if summary_universe else 0.0
+    n_classified_total = n_halal_total + n_question_total + n_haram_total
+    pct_halal_universe = (n_halal_total / n_classified_total) if n_classified_total else 0.0
+    pct_question_universe = (n_question_total / n_classified_total) if n_classified_total else 0.0
+    pct_haram_universe = (n_haram_total / n_classified_total) if n_classified_total else 0.0
 
     stocks_payload = stocks_by_group_payload(stocks)
 
@@ -815,7 +832,7 @@ def build_html(
   <header class="title">
     <h1>Industry Group Rankings <small>· week of {generated}</small></h1>
     <div class="sub">
-      <strong>197 industry groups, ranked.</strong> Each group's relative-strength
+      <strong>{summary_with_data} industry groups, ranked.</strong> Each group's relative-strength
       score is computed from a 6-month weighted price formula across its
       constituent stocks. Each constituent is also screened for Shariah status
       using AAOIFI methodology — business-activity test plus financial-ratio
@@ -843,7 +860,7 @@ def build_html(
   </section>
 
   <section>
-    <h2>Full ranking — all {summary_total} groups</h2>
+    <h2>Full ranking — {summary_with_data} ranked groups</h2>
     <div class="controls">
       <input id="search" type="text" placeholder="Search group or sector…" />
       <select id="sectorSel">{sector_options}</select>
@@ -891,15 +908,23 @@ def build_html(
        <span class="kbd">0.4·(P/P₋₆₅) + 0.2·(P/P₋₁₃₀) + 0.2·(P/P₋₁₉₅) + 0.2·(P/P₋₂₆₀)</span>
        and converted to a 1–99 percentile rating against the full universe.
        The composite z-score blends median RS rating (60%) with annualised
-       price-trend slope (40%); groups are ranked 1 (strongest) to N (weakest).
-       Shariah classification uses AAOIFI Shariah Standard No. 21 — business
-       activity screen plus the three financial ratios (debt ≤30% of market
-       cap, interest-bearing assets ≤30%, impure income ≤5%).</p>
-    <p><strong>Universe.</strong> {summary_universe} stocks across
-       {summary_total} groups · {n_halal_total} marked Halal
+       price-trend slope (40%); groups are ranked 1 (strongest) to N (weakest).</p>
+    <p><strong>Shariah screening.</strong> Two-step approach: (1) business-activity
+       screen rules out impermissible core businesses — banks, insurers,
+       alcohol, tobacco, gambling, conventional lenders, mortgage REITs;
+       (2) debt-to-market-cap screen flags Halal-business companies whose
+       interest-bearing debt exceeds the AAOIFI 33% threshold and downgrades
+       them to "Questionable". The remaining AAOIFI ratios — interest-bearing
+       securities and impure income — are <em>not</em> independently verified
+       here. For full AAOIFI compliance verification, cross-check with
+       <a href="https://zoya.finance" target="_blank" rel="noopener" style="color:var(--accent);">Zoya</a>
+       or <a href="https://musaffa.com" target="_blank" rel="noopener" style="color:var(--accent);">Musaffa</a>
+       before investing.</p>
+    <p><strong>Universe.</strong> {summary_universe} stocks priced across
+       {summary_total} groups · {n_halal_total} classified Halal
        ({pct_halal_universe:.0%}) · {n_question_total} Questionable
-       ({n_question_total/summary_universe:.0%}) · {n_haram_total} Haram
-       ({n_haram_total/summary_universe:.0%}).</p>
+       ({pct_question_universe:.0%}) · {n_haram_total} Haram
+       ({pct_haram_universe:.0%}).</p>
     <p><strong>Disclaimer.</strong> Shariah classifications here are a model,
        not a fatwa. Cross-check against Musaffa, Zoya, or your scholar before
        acting. Nothing here is investment advice. Equity prices may fall as

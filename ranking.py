@@ -1,4 +1,4 @@
-"""
+ """
 Core IBD Industry Group Rank model.
 
 Methodology (mirrors IBD/William O'Neil + Co. publicly described approach):
@@ -172,10 +172,16 @@ def build_stock_table(
     constituents: Mapping[str, Mapping[str, Sequence[str]]],
     prices: pd.DataFrame,
     history_days: int = 130,
+    fundamentals: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Per-stock detail: ticker, sector, group, RS rating (1..99), price,
-    6-month price change, Shariah status, and a compact price history string
-    (last N closes, semicolon-separated, rounded to 2dp) for inline charts."""
+    6-month price change, Shariah status (with optional debt-ratio refinement),
+    and a compact price history string for inline charts.
+
+    `fundamentals` is an optional DataFrame indexed by ticker with column
+    `debt_to_market_cap`. If provided, Shariah classification will downgrade
+    HALAL business-activity verdicts to QUESTIONABLE when ratio > 33%.
+    """
     from shariah import classify_ticker  # local import to avoid hard dependency
 
     rs_raw = weighted_rs_raw(prices)
@@ -203,11 +209,20 @@ def build_stock_table(
         for col in history_window.columns
     }
 
+    # Build {ticker: debt_to_mcap} lookup if fundamentals were provided
+    debt_lookup: dict[str, float] = {}
+    if fundamentals is not None and "debt_to_market_cap" in fundamentals.columns:
+        for tk, row in fundamentals.iterrows():
+            r = row.get("debt_to_market_cap")
+            if pd.notna(r):
+                debt_lookup[tk] = float(r)
+
     rows = []
     for sector, groups in constituents.items():
         for group, tickers in groups.items():
             for t in tickers:
-                shariah = classify_ticker(t, sector, group)
+                debt_ratio = debt_lookup.get(t)
+                shariah = classify_ticker(t, sector, group, debt_ratio)
                 if t not in prices.columns:
                     rows.append({
                         "ticker": t, "sector": sector, "group": group,
@@ -215,6 +230,7 @@ def build_stock_table(
                         "six_month_change": pd.NA, "history": "",
                         "shariah_status": shariah.status,
                         "shariah_reason": shariah.reason,
+                        "debt_to_market_cap": debt_ratio if debt_ratio is not None else pd.NA,
                     })
                     continue
                 rows.append({
@@ -227,6 +243,7 @@ def build_stock_table(
                     "history": history_str.get(t, ""),
                     "shariah_status": shariah.status,
                     "shariah_reason": shariah.reason,
+                    "debt_to_market_cap": debt_ratio if debt_ratio is not None else pd.NA,
                 })
     df = pd.DataFrame(rows)
     df["rs_rating"] = df["rs_rating"].astype("Int64")
@@ -238,14 +255,27 @@ def rank_groups(
     prices: pd.DataFrame,
     rs_weight: float = 0.6,
     trend_weight: float = 0.4,
+    fundamentals: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """End-to-end: given {sector: {group: [tickers]}} and a price panel,
     return a DataFrame with one row per group, ranked 1..N.
 
     Columns: group, sector, n_stocks, n_with_data, median_rs_rating,
-             price_trend_annualised, composite_score, rank, pct_halal
+             price_trend_annualised, composite_score, rank, pct_halal,
+             n_halal, n_questionable, n_haram
+
+    `fundamentals` is an optional DataFrame indexed by ticker with column
+    `debt_to_market_cap`, used to refine Shariah counts.
     """
     from shariah import group_summary  # local import
+
+    # Build {ticker: debt_to_mcap} lookup if fundamentals were provided
+    debt_lookup: dict[str, float] = {}
+    if fundamentals is not None and "debt_to_market_cap" in fundamentals.columns:
+        for tk, row in fundamentals.iterrows():
+            r = row.get("debt_to_market_cap")
+            if pd.notna(r):
+                debt_lookup[tk] = float(r)
 
     # 1. Per-stock RS rating across the full universe
     rs_raw = weighted_rs_raw(prices)
@@ -268,8 +298,9 @@ def rank_groups(
     # 4. Rank: 1 = best (highest composite). NaNs go to the end.
     df["rank"] = df["composite_score"].rank(method="min", ascending=False).astype("Int64")
 
-    # 5. Attach halal-coverage stats per group.
-    sh_summary = group_summary(constituents)
+    # 5. Attach Shariah-coverage stats per group, using debt_lookup for
+    # ratio-based refinement of HALAL business-activity verdicts.
+    sh_summary = group_summary(constituents, debt_lookup)
     df["pct_halal"] = df["group"].map(
         lambda g: sh_summary.get(g, {}).get("pct_halal", np.nan)
     )

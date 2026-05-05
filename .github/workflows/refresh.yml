@@ -1,0 +1,99 @@
+# .github/workflows/refresh.yml
+#
+# Refreshes the industry-group rankings every Friday after market close
+# and publishes the updated HTML to GitHub Pages. Also runs on every push
+# to the main branch so you can test changes immediately.
+#
+# To use this:
+#   1. Save this file at .github/workflows/refresh.yml in your repo
+#   2. In repo Settings → Pages, set Source = "GitHub Actions"
+#   3. Wait for the first run (Actions tab) — your page goes live at
+#      https://<username>.github.io/<repo-name>/
+
+name: Refresh rankings
+
+on:
+  schedule:
+    # Cron is in UTC. 22:00 UTC Friday = 5:00 PM EST / 6:00 PM EDT
+    # i.e. about 1-2 hours after the US market close.
+    - cron: '0 22 * * 5'
+  push:
+    # Also rebuild whenever code changes on main, so edits show up fast.
+    branches: [main]
+  workflow_dispatch:
+    # Lets you trigger a manual run from the Actions tab whenever you want.
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Avoid two runs stepping on each other if you push during a scheduled run.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy yfinance
+
+      - name: Run the ranking pipeline (live data)
+        run: python rank.py --backend yfinance
+
+      - name: Verify we got real data, not synthetic
+        # Belt-and-braces: refuse to deploy if meta.json says the data is fake.
+        run: |
+          python -c "
+          import json, sys
+          meta = json.load(open('meta.json'))
+          if not meta.get('is_real_data'):
+              print('ERROR: meta.json says data is not real. Refusing to deploy.')
+              sys.exit(1)
+          if meta.get('n_tickers_with_prices', 0) < 500:
+              print(f'ERROR: only {meta[\"n_tickers_with_prices\"]} tickers got prices — yfinance probably failed. Refusing to deploy.')
+              sys.exit(1)
+          print(f'OK: real data, {meta[\"n_tickers_with_prices\"]} tickers, {meta[\"n_sessions\"]} sessions')
+          "
+
+      - name: Build the HTML page
+        run: python publish_html.py
+
+      - name: Stage the page for GitHub Pages
+        # GitHub Pages serves whatever's in the artifact. We copy the HTML
+        # into a clean folder and rename to index.html so the URL is just
+        # /groupranks/ not /groupranks/group_ranks.html
+        run: |
+          mkdir -p _site
+          cp group_ranks.html _site/index.html
+          # Optional: also publish the raw CSVs in case anyone wants the data
+          cp group_ranks.csv _site/group_ranks.csv
+          cp stocks.csv _site/stocks.csv
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

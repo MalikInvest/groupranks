@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from prices import fetch_prices
+from prices import fetch_prices, fetch_fundamentals
 from ranking import rank_groups, build_stock_table
 
 
@@ -81,16 +81,27 @@ def main():
     prices = fetch_prices(tickers, backend=args.backend)
     print(f"Got prices for {prices.shape[1]} tickers across {prices.shape[0]} sessions")
 
+    print(f"Fetching fundamentals (debt + market cap) for ratio screening …")
+    try:
+        fundamentals = fetch_fundamentals(tickers, backend=args.backend)
+        n_with_ratio = fundamentals["debt_to_market_cap"].notna().sum()
+        print(f"Got debt-to-market-cap ratios for {n_with_ratio}/{len(tickers)} tickers")
+    except Exception as e:
+        print(f"⚠  Failed to fetch fundamentals: {e}")
+        print(f"   Falling back to business-activity-only Shariah screening")
+        fundamentals = None
+
     df = rank_groups(
         full_map,
         prices,
         rs_weight=args.rs_weight,
         trend_weight=args.trend_weight,
+        fundamentals=fundamentals,
     )
     df.to_csv(args.out, index=False)
     print(f"\nWrote full rank table to {args.out}")
 
-    stocks = build_stock_table(full_map, prices)
+    stocks = build_stock_table(full_map, prices, fundamentals=fundamentals)
     stocks.to_csv(args.out_stocks, index=False)
     print(f"Wrote stock detail table to {args.out_stocks} "
           f"({len(stocks)} rows, "
